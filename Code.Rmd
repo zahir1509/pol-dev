@@ -1,0 +1,564 @@
+---
+title: "Studying Infrastructure Development and Economic Growth in Rural India"
+author: "Aditya Sarkar and Mohammed Zahir Ali"
+date: "08/05/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list=ls())
+setwd('/Research Project/')
+```
+
+#### Importing the required libraries
+
+```{r imports, warning=FALSE,message=FALSE,error=FALSE}
+library(knitr)
+library(tidyverse)
+library(ggplot2)
+library(ggthemes)
+library(ggrepel)
+library(stargazer)
+library(sf)
+library(viridis)
+library(stringdist)
+library(rvest)
+library(stringr)
+library(lubridate)
+library(psych)
+library(corrplot)
+library(factoextra)  # for visualization
+library(caret)       # for data preprocessing
+library(stats)       # for PCA function
+library(VIM)
+```
+
+#### Importing the datasets
+
+
+We are using datasets from SHRUG. Namely, the following datasets have been used:
+
+- Primary Census (2011)
+- Economic Census (2013)
+- Socioeconomic and Caste Census (2012)
+- Night Lights Dataset 
+
+```{r imports-2, warning=FALSE, message=FALSE, error=FALSE}
+roads = read.csv('csv_shrug-v1.5.samosa-ancillary-csv/shrug-v1.5.samosa-ancillary-csv/shrug_ancillary.csv', stringsAsFactors = F)
+nl = read.csv('csv_shrug-v1.5.samosa-nl-csv/shrug-v1.5.samosa-nl-csv/shrug_nl_wide.csv', stringsAsFactors = F)
+pc = read.csv('csv_shrug-v1.5.samosa-pop-econ-census-csv/shrug-v1.5.samosa-pop-econ-census-csv/shrug_pc11.csv', stringsAsFactors = F)
+ec = read.csv('csv_shrug-v1.5.samosa-pop-econ-census-csv/shrug-v1.5.samosa-pop-econ-census-csv/shrug_ec.csv', stringsAsFactors = F)
+secc = read.csv('csv_shrug-v1.5.samosa-secc-csv/shrug-v1.5.samosa-secc-csv/shrug_secc.csv', stringsAsFactors = F)
+```
+
+Initially, we were also planning to use the PMGSY Roads dataset - since length of paved roads was a potential proxy for infrastructure development in rural areas. But given that we are predominantly working with census data from 2011 and 2013, we needed to limit out analysis from other datasets to that point in time. 
+
+```{r}
+glimpse(roads)
+```
+
+But the date variables in the Roads dataset had a lot of missing values, rendering it difficult to isolate the datapoints of interest. We therefore do not use this dataset for further analysis.
+
+From the Economic Census, and the Night Lights dataset, we only keep the variables from 2013.
+
+```{r EC-NL-coldrop, warning=FALSE, message=FALSE, error=FALSE}
+ec = ec %>% 
+  select(shrid, ec13_emp_all, ec13_emp_manuf, ec13_emp_services)
+
+nl = nl %>% 
+  select(shrid, num_cells, total_light2013, total_light_cal2013)
+```
+
+We can now have a look at how many data points we have across all our datasets.
+
+```{r}
+cat(paste("ec:", nrow(ec), "rows x", ncol(ec), "columns |",
+          "nl:", nrow(nl), "rows x", ncol(nl), "columns |",
+          "pc:", nrow(pc), "rows x", ncol(pc), "columns |",
+          "secc:", nrow(secc), "rows x", ncol(secc), "columns |"))
+```
+
+Since we will be using SHRIDs as common keys for merging, we need to filter the datasets to the SHRIDs that are common across all datasets.
+
+
+```{r SHRID-subset-1, warning=FALSE, message=FALSE, error=FALSE}
+common_shrids = Reduce(intersect, lapply(list(ec$shrid, nl$shrid, pc$shrid, secc$shrid), unique))
+
+# Subset each dataset using common SHRIDs
+
+ec = subset(ec, shrid %in% common_shrids)
+nl = subset(nl, shrid %in% common_shrids)
+pc = subset(pc, shrid %in% common_shrids)
+secc = subset(secc, shrid %in% common_shrids)
+```
+
+Let us now have a look at the number of rows after subsetting the datasets to common SHRIDs.
+
+```{r echo=F}
+cat(paste("ec:", nrow(ec), "rows x", ncol(ec), "columns |",
+          "nl:", nrow(nl), "rows x", ncol(nl), "columns |",
+          "pc:", nrow(pc), "rows x", ncol(pc), "columns |",
+          "secc:", nrow(secc), "rows x", ncol(secc), "columns |"))
+```
+
+We then aggregate the metrics for Education (number of educational institutions), Power Supply (across summer and winter months for all use cases), and average Night Light.
+
+```{r error=F, warning=F, message=F}
+pc = pc %>% 
+  mutate(num_edu = pc11_vd_p_sch + pc11_vd_s_sch + pc11_vd_m_sch + pc11_vd_s_s_sch + pc11_vd_college) %>% 
+  mutate(mean_power_supply = (pc11_vd_power_all_sum + pc11_vd_power_all_win)/2)
+
+nl = nl %>% 
+  mutate(lights = total_light_cal2013/num_cells)
+
+head(pc %>% select(shrid, num_edu, mean_power_supply)) %>% knitr::kable()
+head(nl) %>% knitr::kable()
+```
+
+We merge the PC and SECC dataset to create a metric for agricultural employment.
+
+```{r error=F, warning=F, message=F}
+pc_secc = left_join(pc, secc, by = 'shrid')
+
+# Create a mean of number of members per household for both urban and rural
+
+pc_secc$hh_size_mean = ifelse(is.na(pc_secc$num_members_mean_rural) & !is.na(pc_secc$num_members_mean_urban), pc_secc$num_members_mean_urban,
+                              ifelse(is.na(pc_secc$num_members_mean_urban) & !is.na(pc_secc$num_members_mean_rural), pc_secc$num_members_mean_rural,
+                                     ifelse(!is.na(pc_secc$num_members_mean_rural) & !is.na(pc_secc$num_members_mean_urban), mean(c(pc_secc$num_members_mean_rural, pc_secc$num_members_mean_urban)), 
+                                            NA)))
+
+# Drop the rows which have NA for the final Household size column
+
+pc_secc = pc_secc[complete.cases(pc_secc$hh_size_mean),]
+
+glimpse(pc_secc$hh_size_mean)
+```
+
+```{r echo=F, error=F, warning=F, message=F}
+# Subset all datasets again based on the pc_secc dataset created without NA vals
+
+common_shrids = Reduce(intersect, lapply(list(ec$shrid, nl$shrid, pc$shrid, secc$shrid, pc_secc$shrid), unique))
+
+ec = subset(ec, shrid %in% common_shrids)
+nl = subset(nl, shrid %in% common_shrids)
+pc = subset(pc, shrid %in% common_shrids)
+secc = subset(secc, shrid %in% common_shrids)
+```
+
+Derive the agricultural employment variable based on number of households, mean household size, and an estimate of how many members per household would be involved in agriculture(2).
+
+```{r error=F, warning=F, message=F}
+pc_secc = pc_secc %>% 
+  mutate(agr_emp = (secc_inc_cultiv_share * pc11_pca_no_hh * hh_size_mean)/2)
+
+# Drop NA rows for this new column and subset all datasets again
+
+pc_secc = pc_secc[complete.cases(pc_secc$agr_emp),]
+glimpse(pc_secc$agr_emp)
+```
+
+```{r echo=F, warning=F, message=F, error=F}
+common_shrids = Reduce(intersect, lapply(list(ec$shrid, nl$shrid, pc$shrid, secc$shrid, pc_secc$shrid), unique))
+
+# Subset each dataset using common town IDs
+ec = subset(ec, shrid %in% common_shrids)
+nl = subset(nl, shrid %in% common_shrids)
+pc = subset(pc, shrid %in% common_shrids)
+secc = subset(secc, shrid %in% common_shrids)
+```
+
+```{r error=F, warning=F, message=F}
+# Merge EC into this to get non-farm employment figures
+
+pc_secc_ec = left_join(pc_secc, ec, by = 'shrid')
+
+# Create a new column using the consumption figures from SECC dataset (mean of urban and rural)
+
+pc_secc_ec$consumption = ifelse(is.na(pc_secc_ec$secc_cons_pc_rural) & !is.na(pc_secc_ec$secc_cons_pc_urban), pc_secc_ec$secc_cons_pc_urban,
+                              ifelse(is.na(pc_secc_ec$secc_cons_pc_urban) & !is.na(pc_secc_ec$secc_cons_pc_rural), pc_secc_ec$secc_cons_pc_rural,
+                                     ifelse(!is.na(pc_secc_ec$secc_cons_pc_rural) & !is.na(pc_secc_ec$secc_cons_pc_urban), mean(c(pc_secc_ec$secc_cons_pc_rural, pc_secc_ec$secc_cons_pc_urban)), 
+                                            NA)))
+
+# Drop NA rows for this new column and subset all datasets
+
+pc_secc_ec = pc_secc_ec[complete.cases(pc_secc_ec$consumption),]
+
+```
+
+```{r echo=F, error=F, warning=F, message=F}
+common_shrids = Reduce(intersect, lapply(list(ec$shrid, nl$shrid, pc$shrid, secc$shrid, pc_secc$shrid, pc_secc_ec$shrid), unique))
+
+ec = subset(ec, shrid %in% common_shrids)
+nl = subset(nl, shrid %in% common_shrids)
+pc = subset(pc, shrid %in% common_shrids)
+secc = subset(secc, shrid %in% common_shrids)
+```
+
+
+```{r error=F, warning=F, message=F}
+# Create a new column for poverty rate (PPP) - based on mean of urban and rural
+
+pc_secc_ec$PPP = ifelse(is.na(pc_secc_ec$secc_pov_rate_rural) & !is.na(pc_secc_ec$secc_pov_rate_urban), pc_secc_ec$secc_pov_rate_urban,
+                                ifelse(is.na(pc_secc_ec$secc_pov_rate_urban) & !is.na(pc_secc_ec$secc_pov_rate_rural), pc_secc_ec$secc_pov_rate_rural,
+                                       ifelse(!is.na(pc_secc_ec$secc_pov_rate_rural) & !is.na(pc_secc_ec$secc_pov_rate_urban), mean(c(pc_secc_ec$secc_pov_rate_rural, pc_secc_ec$secc_pov_rate_urban)), 
+                                              NA)))
+
+# Drop NA rows from this new PPP column and subset all datasets
+
+pc_secc_ec = pc_secc_ec[complete.cases(pc_secc_ec$PPP),]
+
+# Add NL figures to this dataset to create the final dataset.
+
+pc_secc_ec_nl = left_join(pc_secc_ec, nl, by='shrid')
+```
+
+
+
+```{r error=F, warning=F, message=F}
+# Create a new dataset with the aggregated columns which will serve as proxies for our IV and DV
+
+final_corr = pc_secc_ec_nl %>% 
+  select(shrid, pc11_pca_tot_p, hh_size_mean, pc11_vd_area, num_edu, mean_power_supply, agr_emp, ec13_emp_all, consumption, PPP, lights)
+
+# Normalize the sum variables based on 1k population
+
+final_corr = final_corr %>% 
+  mutate(edu_norm = num_edu/((pc11_pca_tot_p)/1000),
+         agr_emp_norm = agr_emp/((pc11_pca_tot_p)/1000),
+         ec13_emp_all_norm = ec13_emp_all/((pc11_pca_tot_p)/1000))
+
+final_corr = na.omit(final_corr)
+
+glimpse(final_corr)
+
+# Create a correlation matrix after dropping shrid column
+final_corr_matrix = cor(final_corr[, -1])
+
+corrplot(final_corr_matrix, method = "color", addCoef.col = "black", 
+         type = "upper", order = "hclust", tl.col = "black", 
+         tl.srt = 45, number.cex=0.7, tl.cex = 0.8)
+```
+
+We find no meaningful correlations. This brings into question the validity of our aggregates. Since the aggregates were made for variables with high multicollinearity, Principal Component Analysis would serve as a good tool for aggregating the X variables.
+
+```{r echo=T, error=F, warning=F, message=F}
+Y_vars = pc_secc_ec_nl %>% 
+  select(ec13_emp_all, agr_emp, secc_cons_pc_rural, secc_pov_rate_rural)
+Y_vars = na.omit(Y_vars)
+Y_vars_corr = cor(Y_vars)
+
+corrplot(Y_vars_corr, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.8, method = "circle", number.cex = 0.8,
+         addCoef.col = "black", addCoefasPercent = TRUE, 
+         col = colorRampPalette(c("white", "lightgreen"))(50))
+```
+
+While it would have been worthwhile to consider metrics of economic growth as X variables and generate their Principal Components and see how they are linked to Infrastructure, it does not make sense to do that here since we only have 4 variables and low dimensionality. Also PCA works best for variables that are multicollinear, because it creates orthogonal projections based on the existing relationships within the variables to best explain the variance in the dataset. In the plot above, we can see that the metrics of economic growth that we are considering for analysis are not multicollinear.
+
+```{r error=F, warning=F, message=F}
+pca_data = pc_secc_ec_nl %>% 
+  select(shrid, pc11_pca_tot_p, pc11_pca_tot_p_r, pc11_pca_no_hh, pc11_pca_p_lit, pc11_vd_p_sch, pc11_vd_m_sch, pc11_vd_s_sch, pc11_vd_s_s_sch, pc11_vd_college, pc11_vd_power_all_sum, pc11_vd_power_all_win, lights)
+
+state_keys = read.csv('csv_shrug-v1.5.samosa-pop-econ-census-csv/shrug-v1.5.samosa-keys-csv/shrug_pc11_state_key.csv')
+
+pca_data = na.omit(pca_data)
+
+pca_data_states = left_join(pca_data, state_keys, by = 'shrid')
+
+# Filter for BIMARU states
+pca_data_bimaru = pca_data_states %>% 
+  filter(pc11_state_name == 'bihar' | pc11_state_name == 'madhya pradesh' | pc11_state_name == 'rajasthan' | pc11_state_name == 'uttar pradesh') %>% 
+  select(-shrid, -pc11_state_id, -pc11_state_name)
+  
+pca_data_bimaru = na.omit(pca_data_bimaru)
+
+pca_data_corr_bimaru = cor(pca_data_bimaru)
+```
+
+Create a correlation heatmap of the dataset before PCA to check multicollinearity.
+
+```{r error=F, warning=F, message=F}
+corrplot(pca_data_corr_bimaru, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.8, method = "circle", number.cex = 0.8,
+         addCoef.col = "black", addCoefasPercent = TRUE, 
+         col = colorRampPalette(c("white", "orange"))(50))
+
+# Fit the factor model and extract the eigenvalues
+model_bimaru = principal(pca_data_bimaru, nfactors = ncol(pca_data_bimaru), rotate = "none")
+eigenvalues_bimaru = model_bimaru$values
+
+# Plot the scree plot
+plot(eigenvalues_bimaru, type = "b", xlab = "Factor", ylab = "Eigenvalue",
+     main = "Scree Plot")
+
+#PC Analysis
+pc_bimaru = prcomp(pca_data_bimaru, scale. = TRUE)
+
+# Visualize explained variance
+fviz_eig(pc_bimaru, addlabels = TRUE, ylim = c(0, 70)) +
+  theme_minimal() +
+  ggtitle("Explained Variance")
+```
+
+We can see that the first 4 PCs explain most of the variance in the dataset, so we only consider these PCs for further analysis.
+
+```{r echo=T, error=F, warning=F, message=F}
+# Extract the PC loadings and scores
+loadings_bimaru <- pc_bimaru$rotation
+scores_bimaru <- pc_bimaru$x 
+
+scores_bimaru <- scores_bimaru[, 0:4] # Only take the first 4 PCs
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+pc_scores_corr_bimaru <- cor(scores_bimaru)
+
+# Create a correlation heatmap of the scores after PCA 
+corrplot(pc_scores_corr_bimaru, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.8, method = "circle", 
+         addCoef.col = "black", addCoefasPercent = TRUE, 
+         col = colorRampPalette(c("white", "orange"))(50))
+```
+
+We can now see that there is no multicollinearity because all Principal Components are orthogonal to one another.
+
+Next we run a multiple linear regression with scores of the PCA as predictors and Y as a metric of economic growth. 
+
+##### Poverty Rate (PPP)
+
+```{r echo=F, error=F, warning=F, message=F}
+
+pca_data_bimaru = pca_data_states %>% 
+  filter(pc11_state_name == 'bihar' | pc11_state_name == 'madhya pradesh' | pc11_state_name == 'rajasthan' | pc11_state_name == 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_bimaru = na.omit(pca_data_bimaru)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_bimaru, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_bimaru, Y$secc_pov_rate_tend_rural)
+model <- lm(Y.secc_pov_rate_tend_rural ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Consumption
+
+```{r echo=F, error=F, warning=F, message=F}
+
+pca_data_bimaru = pca_data_states %>% 
+  filter(pc11_state_name == 'bihar' | pc11_state_name == 'madhya pradesh' | pc11_state_name == 'rajasthan' | pc11_state_name == 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_bimaru = na.omit(pca_data_bimaru)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_bimaru, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_bimaru, Y$secc_cons_pc_rural)
+model <- lm(Y.secc_cons_pc_rural ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Agricultural Employment
+
+```{r echo=F, error=F, warning=F, message=F}
+
+pca_data_bimaru = pca_data_states %>% 
+  filter(pc11_state_name == 'bihar' | pc11_state_name == 'madhya pradesh' | pc11_state_name == 'rajasthan' | pc11_state_name == 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_bimaru = na.omit(pca_data_bimaru)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_bimaru, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_bimaru, Y$agr_emp)
+model <- lm(Y.agr_emp ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Non-farm Employment
+
+```{r echo=F, error=F, warning=F, message=F}
+
+pca_data_bimaru = pca_data_states %>% 
+  filter(pc11_state_name == 'bihar' | pc11_state_name == 'madhya pradesh' | pc11_state_name == 'rajasthan' | pc11_state_name == 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_bimaru = na.omit(pca_data_bimaru)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_bimaru, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_bimaru, Y$ec13_emp_all)
+model <- lm(Y.ec13_emp_all ~ ., data = mlr_data)
+summary(model)
+```
+
+#### Rerun PCA for Rest of India (non BIMARU)
+
+```{r echo=F, error=F, warning=F, message=F}
+pca_data = pc_secc_ec_nl %>% 
+  select(shrid, pc11_pca_tot_p, pc11_pca_tot_p_r, pc11_pca_no_hh, pc11_pca_p_lit, pc11_vd_p_sch, pc11_vd_m_sch, pc11_vd_s_sch, pc11_vd_s_s_sch, pc11_vd_college, pc11_vd_power_all_sum, pc11_vd_power_all_win, lights)
+
+state_keys = read.csv('csv_shrug-v1.5.samosa-pop-econ-census-csv/shrug-v1.5.samosa-keys-csv/shrug_pc11_state_key.csv')
+
+pca_data = na.omit(pca_data)
+
+pca_data_states = left_join(pca_data, state_keys, by = 'shrid')
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+
+pca_data_roi = pca_data_states %>% 
+  filter(pc11_state_name != 'bihar' & pc11_state_name != 'madhya pradesh' & pc11_state_name != 'rajasthan' & pc11_state_name != 'uttar pradesh') %>% 
+  select(-shrid, -pc11_state_id, -pc11_state_name)
+
+pca_data_roi = na.omit(pca_data_roi)
+
+pca_data_corr_roi = cor(pca_data_roi)
+```
+
+Create a correlation heatmap of the dataset before PCA to check multicollinearity.
+
+```{r error=F, warning=F, message=F}
+corrplot(pca_data_corr_roi, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.8, method = "circle", number.cex = 0.8,
+         addCoef.col = "black", addCoefasPercent = TRUE, 
+         col = colorRampPalette(c("white", "cyan"))(50))
+
+# Fit the factor model and extract the eigenvalues
+model_roi = principal(pca_data_roi, nfactors = ncol(pca_data_roi), rotate = "none")
+eigenvalues_roi = model_roi$values
+
+# Plot the scree plot
+plot(eigenvalues_roi, type = "b", xlab = "Factor", ylab = "Eigenvalue",
+     main = "Scree Plot")
+
+#PC Analysis
+pc_roi = prcomp(pca_data_roi, scale. = TRUE)
+
+# Visualize explained variance
+fviz_eig(pc_roi, addlabels = TRUE, ylim = c(0, 70)) +
+  theme_minimal() +
+  ggtitle("Explained Variance")
+
+```
+
+We can see that the first 4 PCs explain most of the variance in the dataset so we only limit our analysis to these 4 PCs.
+
+```{r echo=T, error=F, warning=F, message=F}
+# Extract the PC loadings and scores
+loadings_roi <- pc_roi$rotation
+scores_roi <- pc_roi$x 
+scores_roi <- scores_roi[, 0:4] # Only take the first 4 PCs
+```
+
+Create a correlation heatmap of the scores after PCA - to ensure that the PCs are orthogonal and that there is no multicollinearity.
+
+```{r echo=T, error=F, warning=F, message=F}
+pc_scores_corr_roi <- cor(scores_roi)
+
+corrplot(pc_scores_corr_roi, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45, 
+         tl.cex = 0.8, method = "circle", 
+         addCoef.col = "black", addCoefasPercent = TRUE, 
+         col = colorRampPalette(c("white", "cyan"))(50))
+```
+
+We can now see that there is no multicollinearity because all Principal Components are orthogonal to one another.
+
+Next we run a multiple linear regression with scores of the PCA as predictors and Y as a metric of economic growth. 
+
+##### Poverty Rate (PPP)
+
+```{r echo=F, error=F, warning=F, message=F}
+pca_data_roi = pca_data_states %>% 
+  filter(pc11_state_name != 'bihar' & pc11_state_name != 'madhya pradesh' & pc11_state_name != 'rajasthan' & pc11_state_name != 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_roi = na.omit(pca_data_roi)
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_roi, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_roi, Y$secc_pov_rate_rural)
+model <- lm(Y.secc_pov_rate_rural ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Consumption
+
+```{r echo=F, error=F, warning=F, message=F}
+pca_data_roi = pca_data_states %>% 
+  filter(pc11_state_name != 'bihar' & pc11_state_name != 'madhya pradesh' & pc11_state_name != 'rajasthan' & pc11_state_name != 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_roi = na.omit(pca_data_roi)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_roi, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_roi, Y$secc_cons_pc_rural)
+model <- lm(Y.secc_cons_pc_rural ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Agricultural Employment
+
+```{r echo=F, error=F, warning=F, message=F}
+pca_data_roi = pca_data_states %>% 
+  filter(pc11_state_name != 'bihar' & pc11_state_name != 'madhya pradesh' & pc11_state_name != 'rajasthan' & pc11_state_name != 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_roi = na.omit(pca_data_roi)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_roi, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_roi, Y$agr_emp)
+model <- lm(Y.agr_emp ~ ., data = mlr_data)
+summary(model)
+```
+
+##### Non-farm Employment
+
+```{r echo=F, error=F, warning=F, message=F}
+pca_data_roi = pca_data_states %>% 
+  filter(pc11_state_name != 'bihar' & pc11_state_name != 'madhya pradesh' & pc11_state_name != 'rajasthan' & pc11_state_name != 'uttar pradesh') %>% 
+  select(-pc11_state_id, -pc11_state_name)
+
+pca_data_roi = na.omit(pca_data_roi)
+
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_roi, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_roi, Y$ec13_emp_all)
+model <- lm(Y.ec13_emp_all ~ ., data = mlr_data)
+summary(model)
+```
+
+```{r echo=T, error=F, warning=F, message=F}
+Y = left_join(pca_data_roi, pc_secc_ec_nl, by = 'shrid')
+mlr_data <- data.frame(scores_roi, Y$ec13_emp_all)
+model <- lm(Y.ec13_emp_all ~ ., data = mlr_data)
+summary(model)
+```
+
+
+
